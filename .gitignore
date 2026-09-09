@@ -1,0 +1,30 @@
+# Ignore specific prompt/instruction files
+prompt.md
+PROMPT.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.sqlite3
+
+# Node.js / Frontend
+node_modules/
+.next/
+out/
+build/
+dist/
+
+# Environment variables & secrets
+.env
+.env*.local
+*.pem
+
+# Operating System / IDE files
+.DS_Store
+.vscode/
+.idea/
+*.log
