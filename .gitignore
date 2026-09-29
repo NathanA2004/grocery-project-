@@ -2,6 +2,9 @@
 prompt.md
 PROMPT.md
 
+# Local FAISS index written by the API
+backend/data/
+
 # Python
 __pycache__/
 *.py[cod]
