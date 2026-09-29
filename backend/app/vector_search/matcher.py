@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import Any
 
 import faiss
 import numpy as np
+from pydantic import TypeAdapter, ValidationError
 from sentence_transformers import SentenceTransformer
 
 from ..schemas import ProductTile, UnitType
@@ -52,7 +55,10 @@ class SemanticMatcher:
         # Weights load from the local Hugging Face cache (downloaded once).
         # Queries are never sent to a hosted embedding API.
         self._model = SentenceTransformer(model_name)
-        dim = int(self._model.get_sentence_embedding_dimension())
+        dimension = getattr(self._model, "get_embedding_dimension", None)
+        if dimension is None:
+            dimension = self._model.get_sentence_embedding_dimension
+        dim = int(dimension())
         if dim != EMBEDDING_DIM:
             raise ValueError(
                 f"{model_name} reported embedding dimension {dim}, expected {EMBEDDING_DIM}."
@@ -64,6 +70,22 @@ class SemanticMatcher:
         # ProductTile.id -> FAISS label. Blocks a second insert of the same id
         # from shifting later labels away from the tiles already stored.
         self._position_by_id: dict[str, int] = {}
+        self._model_name = model_name
+
+    @property
+    def index(self) -> faiss.Index:
+        """In-process FAISS index. ``index.ntotal`` is the stored tile count."""
+        return self._index
+
+    @property
+    def device(self) -> str:
+        """Torch device the local embedding model is executing on (``cpu`` or ``cuda``)."""
+        return str(self._model.device)
+
+    @property
+    def model_name(self) -> str:
+        """Local sentence-transformers checkpoint name. Weights are not fetched per query."""
+        return self._model_name
 
     def index_flyer_items(self, items: list[ProductTile]) -> None:
         """Embed ``items`` and append them to the FAISS index.
@@ -107,6 +129,56 @@ class SemanticMatcher:
                 f"ids={len(self._position_by_id)}."
             )
         logger.info("Indexed %d flyer tiles (index size %d).", len(fresh), self._index.ntotal)
+
+    def save_state(self, directory: str | Path) -> None:
+        """Write the FAISS index and the tile map to a local directory.
+
+        ``index.faiss`` is the ``IndexFlatIP`` binary. ``tiles.json`` is the
+        ``ProductTile`` list in label order. Nothing is uploaded.
+        """
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        faiss.write_index(self._index, str(directory / "index.faiss"))
+        payload = [tile.model_dump(mode="json") for tile in self._tiles]
+        (directory / "tiles.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    def load_state(self, directory: str | Path) -> bool:
+        """Restore a previously saved index, if both local files are present.
+
+        Returns False when the directory has no saved index. Raises if the
+        files exist but disagree with each other, or if this matcher already
+        holds vectors (loading would detach those labels from ``_tiles``).
+        """
+        directory = Path(directory)
+        index_path = directory / "index.faiss"
+        tiles_path = directory / "tiles.json"
+        if not index_path.is_file() or not tiles_path.is_file():
+            return False
+        if self._tiles or int(self._index.ntotal):
+            raise RuntimeError("Refusing to load FAISS state over an index that already has tiles.")
+
+        index = faiss.read_index(str(index_path))
+        # JSON mode accepts UnitType values. Strict python validation would
+        # require the enum instances, which a saved tile map does not contain.
+        try:
+            tiles = TypeAdapter(list[ProductTile]).validate_json(
+                tiles_path.read_text(encoding="utf-8")
+            )
+        except ValidationError as exc:
+            raise ValueError("FAISS tile map does not contain ProductTile records.") from exc
+        if int(index.d) != EMBEDDING_DIM or int(index.ntotal) != len(tiles):
+            raise ValueError(
+                "FAISS index does not match the tile map "
+                f"(d={index.d}, ntotal={index.ntotal}, tiles={len(tiles)})."
+            )
+        if len({tile.id for tile in tiles}) != len(tiles):
+            raise ValueError("FAISS tile map contains duplicate ProductTile ids.")
+
+        self._index = index
+        self._tiles = tiles
+        self._position_by_id = {tile.id: position for position, tile in enumerate(tiles)}
+        logger.info("Loaded local FAISS index with %d vectors from %s.", index.ntotal, directory)
+        return True
 
     def find_item_matches(
         self,

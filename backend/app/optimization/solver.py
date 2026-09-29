@@ -1,8 +1,9 @@
 """Module 3: multi-store grocery selection with a PuLP MILP.
 
 The model chooses one flyer tile per shopping-list line and decides which
-stores are worth visiting. Travel is a per-store charge (distance from home
-times ``cost_per_km``), added once for each store that sells a chosen tile.
+stores are worth visiting. Travel is a round trip from home: each visited
+store is charged ``2 * distance * cost_per_km``, once, when a chosen tile
+is sold there.
 """
 
 from __future__ import annotations
@@ -11,59 +12,19 @@ import logging
 from typing import Any
 
 import pulp
-from pydantic import Field, ValidationError, field_validator
+from pydantic import ValidationError
 
-from ..schemas import ProductTile, StrictModel
+from ..schemas import OptimizationRequest, OptimizationResult, ProductTile
 
 logger = logging.getLogger(__name__)
 
 # CBC writes 1 as 0.999999. A binary is selected when its value is nearer to 1.
 _SELECTED = 0.5
 
-
-class OptimizationRequest(StrictModel):
-    """Inputs for one basket: the list, home-to-store distances, and visit limits."""
-
-    items: list[str] = Field(..., description="User's grocery items, one entry per unit to buy.")
-    store_distances: dict[str, float] = Field(
-        ...,
-        description="Distance from home to each store, keyed by store id.",
-    )
-    max_stores: int | None = Field(
-        default=3,
-        ge=0,
-        description="Maximum number of distinct stores the trip may visit. None means no cap.",
-    )
-    cost_per_km: float = Field(
-        default=0.20,
-        ge=0,
-        description="Travel cost charged for each unit of distance on a visited store.",
-    )
-
-    @field_validator("store_distances")
-    @classmethod
-    def _distances_are_non_negative(cls, distances: dict[str, float]) -> dict[str, float]:
-        negative = [store_id for store_id, distance in distances.items() if distance < 0]
-        if negative:
-            joined = ", ".join(sorted(negative))
-            raise ValueError(f"store distances must be >= 0 (negative for {joined}).")
-        return distances
-
-
-class OptimizationResult(StrictModel):
-    """Solved basket: money spent, travel charge, and the per-store purchases."""
-
-    total_cost: float = Field(..., description="grocery_cost + travel_cost.")
-    grocery_cost: float = Field(..., description="Sum of normalized prices of the chosen tiles.")
-    travel_cost: float = Field(..., description="Sum of per-store travel charges for visited stores.")
-    store_itinerary: dict[str, list[ProductTile]] = Field(
-        ...,
-        description="Tiles purchased at each visited store, keyed by store id.",
-    )
-    unfulfilled_items: list[str] = Field(
-        ...,
-        description="Requested lines with no usable match, or that the store cap left unbought.",
-    )
+# Fallback solves may leave a line unbought. The penalty weight is at least
+# this large, and always larger than the price-plus-travel that line could
+# save, so dropping a buyable line never improves the objective.
+_UNFULFILLED_PENALTY_FLOOR = 10_000.0
 
 
 class OptimizationSolver:
@@ -192,13 +153,14 @@ class OptimizationSolver:
         # Minimize Total Cost =
         #   sum_{j,i} normalized_price_{j,i} * x_{j,i}
         #   + sum_s Travel_s * y_s
-        # where Travel_s = distance_s * cost_per_km.
+        # where Travel_s = 2 * distance_s * cost_per_km (home to the store and back).
         #
-        # The fallback model adds P * u_j for each line. P is larger than the
-        # price-plus-travel a single line can possibly save, and that remains
-        # true for any set of lines, so a feasible exact basket always beats a
-        # basket that drops something. A line is dropped only when max_stores
-        # makes buying it impossible. P is not included in the returned costs.
+        # The fallback model adds a high penalty weight P * u_j for each line.
+        # P is larger than the price-plus-travel a single line can possibly save,
+        # and at least _UNFULFILLED_PENALTY_FLOOR, so that remains true for any
+        # set of lines. A feasible exact basket always beats a basket that drops
+        # something. A line is dropped only when max_stores makes buying it
+        # impossible. P is not included in the returned costs.
         grocery_terms = [
             tiles[candidate].normalized_price * x[line, candidate]
             for line, tiles in options.items()
@@ -266,8 +228,13 @@ class OptimizationSolver:
         return chosen
 
     def _visit_cost(self, store_id: str) -> float:
-        """Travel_s = distance from home to s, times the per-distance cost."""
-        return self._request.store_distances[store_id] * self._request.cost_per_km
+        """Round-trip travel charge for store ``store_id``.
+
+        Distance on the request is one way, from home to the store. Driving
+        there and back is ``2 * distance * cost_per_km``.
+        """
+        distance = self._request.store_distances[store_id]
+        return 2.0 * distance * self._request.cost_per_km
 
     def _build_result(self, chosen: dict[int, ProductTile]) -> OptimizationResult:
         """Rebuild money totals from the chosen tiles.
@@ -302,20 +269,22 @@ def _unfulfilled_penalty(
     options: dict[int, list[ProductTile]],
     travel_cost: dict[str, float],
 ) -> float:
-    """Penalty large enough that dropping a buyable line never improves the objective.
+    """High penalty weight so dropping a buyable line never improves the objective.
 
     Dropping one line saves at most its dearest candidate plus the travel of
     every store that candidate list touches. The penalty is one more than the
-    largest such saving. Dropping a set of lines saves at most the sum of those
-    per-line savings, which is still less than charging the penalty once per
-    dropped line. The solver therefore fulfills every line it is allowed to.
+    largest such saving, and never below ``_UNFULFILLED_PENALTY_FLOOR``.
+    Dropping a set of lines saves at most the sum of those per-line savings,
+    which is still less than charging the penalty once per dropped line. The
+    solver therefore fulfills every line it is allowed to. This weight is
+    applied only on the fallback solve, after an exact assignment is infeasible.
     """
     largest_saving = 0.0
     for tiles in options.values():
         dearest = max(tile.normalized_price for tile in tiles)
         visits = sum(travel_cost[store_id] for store_id in {tile.store_id for tile in tiles})
         largest_saving = max(largest_saving, dearest + visits)
-    return largest_saving + 1.0
+    return max(largest_saving + 1.0, _UNFULFILLED_PENALTY_FLOOR)
 
 
 def _tile_from_hit(hit: object) -> ProductTile | None:

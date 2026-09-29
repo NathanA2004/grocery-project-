@@ -165,6 +165,10 @@ def _extract_clean_title(ocr_text: str) -> str:
 
 
 def _build_paddle_ocr() -> PaddleOCR:
+    import os
+
+    # Read before PaddleX imports. Models already on disk are used as-is.
+    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
     from paddleocr import PaddleOCR
 
     try:
